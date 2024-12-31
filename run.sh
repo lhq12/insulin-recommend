@@ -7,6 +7,7 @@ available_gpus=(0 1 2 3 4 5 6 7) # 92
 # available_gpus=(4 5 6 7)
 # available_gpus=(0 1 2 3)
 # available_gpus=( 3 )
+
 declare -A pid_to_gpu
 
 for lr in "${learning_rates[@]}"; do

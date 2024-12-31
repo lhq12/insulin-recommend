@@ -1,25 +1,8 @@
-"""
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
-
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-"""
-
 import os
 import time
 import math
 import time
+import argparse
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -27,74 +10,73 @@ from torch.nn.utils.clip_grad import clip_grad_norm_
 from model import GPTConfig, GPT
 from glu_dataset import gluDataset
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
 
+def str2bool(v):
+    """
+    str to bool
+    """
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
-out_dir = './out-glucose-prediction'
-eval_interval = 5 # keep frequent because we'll overfit
-log_interval = 10 # don't print too too often
-always_save_checkpoint = False # if True, always save a checkpoint after each eval
-# wandb logging
-wandb_log = True # override via command line if you like
-wandb_project = 'Glucose Prediction'
-wandb_run_name = 'mini-gpt'
+def get_args():
 
-# data
-dataset = 'glucose_dataset'
-batch_size = 64
-block_size = 56 # context of up to 256 previous characters
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--out_dir', type=str, default='./out-glucose-prediction')
+    parser.add_argument('--eval_interval', type=int, default=5)
+    parser.add_argument('--log_interval', type=int, default=10)
+    parser.add_argument('--always_save_checkpoint', action='store_true')
+    parser.add_argument('--wandb_log', type=str2bool, default=True)
+    parser.add_argument('--wandb_run_name', type=str, default='glucose-prediction')
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--block_size', type=int, default=56)
+    parser.add_argument('--n_layer', type=int, default=3)
+    parser.add_argument('--n_head', type=int, default=4)
+    parser.add_argument('--n_embd', type=int, default=512)
+    parser.add_argument('--dropout', type=float, default=0.)
+    parser.add_argument('--bias', type=str2bool, default=False)
+    parser.add_argument('--learning_rate', type=float, default=3e-2)
+    parser.add_argument('--decay_lr', type=str2bool, default=True)
+    parser.add_argument('--warmup_iters', type=int, default=100)
+    parser.add_argument('--lr_decay_iters', type=int, default=600000)
+    parser.add_argument('--min_lr', type=float, default=6e-5)
+    parser.add_argument('--max_epochs', type=int, default=400)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--beta1', type=float, default=0.9)
+    parser.add_argument('--beta2', type=float, default=0.95)
+    parser.add_argument('--grad_clip', type=float, default=0.0)
+    parser.add_argument('--visible_gpu', type=str, default='7')
 
-# model
-# baby GPT model :)
-n_layer = 3
-n_head = 4
-n_embd = 512
-dropout = 0.
-bias = False # do we use bias inside LayerNorm and Linear layers?
-# adamw optimizer
-learning_rate = 3e-2 # with baby networks can afford to go a bit higher
-max_epochs = 400
-min_lr = 1e-4 # learning_rate / 10 usually
-beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
-weight_decay = 1e-4
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 0.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 100 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-visible_gpu = 0 # which gpu to use
-# -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
-os.environ['CUDA_VISIBLE_DEVICES'] = str(visible_gpu)
+    return parser.parse_args()
+
+args = get_args()
+
+os.environ['CUDA_VISIBLE_DEVICES'] = args.visible_gpu
 device = torch.device('cuda:0')
 seed_offset = 0
-tokens_per_iter = batch_size * block_size
+tokens_per_iter = args.batch_size * args.block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
-out_dir = os.path.join(out_dir, f'{time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())}')
+out_dir = os.path.join(args.out_dir, f'{time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())}')
 os.makedirs(out_dir, exist_ok=True)
 
 torch.manual_seed(1337 + seed_offset)
 data_dir = '/remote-home/hongquanliu/Datasets/ZS_DATA/collect_by_id'
-train_set = gluDataset(data_dir, mode='train', block_size=block_size)
-val_set = gluDataset(data_dir, mode='val', block_size=block_size)
-test_set = gluDataset(data_dir, mode='test', block_size=block_size)
+train_set = gluDataset(data_dir, mode='train', block_size=args.block_size)
+val_set = gluDataset(data_dir, mode='val', block_size=args.block_size)
+test_set = gluDataset(data_dir, mode='test', block_size=args.block_size)
 
-train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
 val_loader = DataLoader(val_set, batch_size=256, shuffle=False)
 test_loader = DataLoader(test_set, batch_size=256, shuffle=False)
 
 
-max_iters = max_epochs * len(train_loader)
+max_iters = args.max_epochs * len(train_loader)
 lr_decay_iters = max_iters
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -102,18 +84,8 @@ iter_num = 0
 best_val_loss = 1e9
 best_test_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
-# meta_path = os.path.join(data_dir, 'meta.pkl')
-# meta_vocab_size = None
-# if os.path.exists(meta_path):
-#     with open(meta_path, 'rb') as f:
-#         meta = pickle.load(f)
-#     meta_vocab_size = meta['vocab_size']
-#     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=1, dropout=dropout) # start with model_args from command line
+model_args = dict(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd, block_size=args.block_size,
+                  bias=args.bias, vocab_size=1, dropout=args.dropout) # start with model_args from command line
 print("Initializing a new model from scratch")
 gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
@@ -122,26 +94,26 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), 'cuda')
+optimizer = model.configure_optimizers(args.weight_decay, args.learning_rate, (args.beta1, args.beta2), 'cuda')
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
+    if it < args.warmup_iters:
+        return args.learning_rate * (it + 1) / (args.warmup_iters + 1)
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
-        return min_lr
+        return args.min_lr
     # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    decay_ratio = (it - args.warmup_iters) / (lr_decay_iters - args.warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return args.min_lr + coeff * (args.learning_rate - args.min_lr)
 
 # logging
-if wandb_log:
+if args.wandb_log:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config, mode="offline")
+    wandb.init(project='Glucose Prediction', config=args.__dict__, mode="offline")
 
 @torch.no_grad()
 def estimate_loss(mode=None):
@@ -180,11 +152,11 @@ def estimate_loss(mode=None):
 # training loop
 t0 = time.time()
 iter_num = 0
-for epoch in range(max_epochs):
+for epoch in range(args.max_epochs):
     for data in train_loader:
         
         # determine and set the learning rate for this iteration
-        lr = get_lr(iter_num) if decay_lr else learning_rate
+        lr = get_lr(iter_num) if args.decay_lr else args.learning_rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -192,8 +164,8 @@ for epoch in range(max_epochs):
             data[k] = v.to(device)
         logits, loss = model(**data)
         loss.backward()
-        if grad_clip != 0.0:
-            clip_grad_norm_(model.parameters(), grad_clip)
+        if args.grad_clip != 0.0:
+            clip_grad_norm_(model.parameters(), args.grad_clip)
 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -203,16 +175,16 @@ for epoch in range(max_epochs):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        if iter_num % log_interval == 0:
+        if iter_num % args.log_interval == 0:
             print(f"iter {iter_num}: loss {loss.item():.4f}, time {dt*1000:.2f}ms")
         iter_num += 1
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0:
+        if iter_num % args.eval_interval == 0:
             losses = estimate_loss()
             test_out = estimate_loss('test')
             mae, mse = test_out['mae'], test_out['mse']
-            if wandb_log:
+            if args.wandb_log:
                 wandb.log({
                     "iter": iter_num,
                     "train/loss": losses['train'],
@@ -221,7 +193,7 @@ for epoch in range(max_epochs):
                     "test/mae": mae,
                     "lr": lr,
                 })
-            if losses['val'] < best_val_loss or always_save_checkpoint:
+            if losses['val'] < best_val_loss or args.always_save_checkpoint:
                 best_val_loss = losses['val']
                 if iter_num > 0:
                     checkpoint = {
@@ -229,7 +201,7 @@ for epoch in range(max_epochs):
                         'model_args': model_args,
                         'iter_num': iter_num,
                         'best_val_loss': best_val_loss,
-                        'config': config,
+                        'config': args.__dict__,
                         'test_mae': mae,
                         'test_mse': mse
                     }
